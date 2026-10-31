@@ -1,0 +1,1445 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <title>股權分散表自訂查詢系統</title>
+    <!-- Chart.js + 財務K線套件 -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+    <!-- luxon + adapter must load before the financial chart controller uses the time scale -->
+    <script src="https://cdn.jsdelivr.net/npm/luxon@3.4.4/build/global/luxon.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon@1.3.1/dist/chartjs-adapter-luxon.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-chart-financial@0.2.1/dist/chartjs-chart-financial.min.js"></script>
+    <script>
+    // ════════════════════════════════════════════════════════
+    //  台股 K 線顏色慣例設定 (IIFE 立即執行函式)
+    // ════════════════════════════════════════════════════════
+    // chartjs-chart-financial 預設是歐美慣例：上漲為綠、下跌為紅。
+    // 在台灣股市，習慣是上漲為紅、下跌為綠。
+    // 注意：套件底層畫圖時，是比對「Y軸像素座標」。
+    // Y座標越小代表位置越高（價格越大）。因此 close < open (收盤像素 < 開盤像素) 代表上漲，對應 `.up`。
+    // 而 close > open 代表下跌，對應 `.down`。
+    // 同時，它的顏色設定變數名稱是複數的 `backgroundColors` 與 `borderColors`。
+    (function setTaiwanColors() {
+        // 因此正確的映射邏輯為：
+        // up (上漲) -> 設為紅色 (#EF232A)
+        // down (下跌) -> 設為綠色 (#09AA37)
+        const TWC = { up: '#EF232A', down: '#09AA37', unchanged: '#888888' };
+        
+        const apply = () => {
+            if (!window.Chart) return;
+            // 方法1: 透過 Chart.registry 註冊表覆寫底層預設值
+            try {
+                const el = Chart.registry.getElement('candlestick');
+                if (el && el.defaults) {
+                    el.defaults.backgroundColors = { ...TWC };
+                    el.defaults.borderColors     = { ...TWC };
+                }
+            } catch(e) {}
+            
+            // 方法2: 透過 Chart.defaults 全域預設值覆寫 (雙重保險)
+            const defs = Chart.defaults.elements;
+            if (defs) {
+                ['candlestick','ohlc'].forEach(k => {
+                    if (defs[k]) {
+                        defs[k].backgroundColors = { ...TWC };
+                        defs[k].borderColors     = { ...TWC };
+                    }
+                });
+            }
+        };
+        apply();
+        window.addEventListener('load', apply);
+        window._applyTaiwanColors = apply; // 對外暴露，當其他 plugin (如 annotation) 載入時可再次呼叫以防被覆蓋
+    })();
+    </script>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: "Microsoft JhengHei", sans-serif; padding: 20px; background: #f9f9f9; color: #333; }
+
+        /* ── 控制面板 ── */
+        .control-panel { max-width: 800px; margin: 0 auto 20px auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,.1); }
+        textarea { width: 100%; height: 250px; padding: 10px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace; font-size: 14px; line-height: 1.5; }
+        button { background: #007bff; color: white; border: none; padding: 10px 15px; border-radius: 4px; cursor: pointer; font-size: 14px; }
+        button:hover { background: #0056b3; }
+        button:disabled { background: #aaa; cursor: not-allowed; }
+        .group-panel { margin-top: 15px; border: 1px solid #ddd; border-radius: 4px; background: #fafafa; }
+        .group-panel summary { padding: 10px 12px; cursor: pointer; font-weight: bold; user-select: none; }
+        .group-list { display: flex; flex-direction: column; gap: 8px; padding: 0 12px 12px; }
+        .group-row { display: flex; gap: 8px; align-items: center; }
+        .group-row .group-load-btn { flex: 1; text-align: left; background: #17a2b8; }
+        .group-row .group-delete-btn { background: #dc3545; flex: 0 0 auto; }
+        .group-empty { color: #777; font-size: .9em; padding: 2px 0; }
+        .group-editor { display: none; margin-top: 12px; gap: 10px; align-items: center; flex-wrap: wrap; }
+        .group-editor input { flex: 1 1 220px; min-width: 0; padding: 9px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
+
+        /* ── 換頁導覽 ── */
+        .nav-container { text-align: center; margin: 20px 0; display: none; }
+        .table-container { display: flex; gap: 20px; justify-content: center; margin-top: 10px; }
+        table { border-collapse: collapse; width: 350px; cursor: pointer; background: white; box-shadow: 0 1px 3px rgba(0,0,0,.1); }
+        th, td { border: 1px solid #ddd; padding: 10px; text-align: center; }
+        th { background: #f4f4f4; color: #555; }
+        tr:hover { background: #e0f7fa; }
+
+        /* ── Modal ── */
+        #modal { display: none; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+                 background: rgba(0,0,0,.75); justify-content: center; align-items: center;
+                 z-index: 1000; overflow: hidden; padding: 2vh 2vw; box-sizing: border-box; }
+        .modal-content { display: flex; flex-direction: column; background: white; padding: 20px; border-radius: 8px; position: relative;
+                         width: 100%; max-width: 1640px; height: 100%; margin: 0 auto; box-sizing: border-box; }
+
+        /* ── 圖表區 ── */
+        .chart-title { font-size: 15px; font-weight: bold; margin: 0 0 6px 4px; color: #222; flex-shrink: 0; }
+        .chart-wrap { position: relative; background: white; margin-bottom: 10px; flex: 1; min-height: 0; }
+        .chart-wrap canvas { display: block; width: 100% !important; height: 100% !important; }
+
+        /* ── Modal 操作列 ── */
+        .modal-nav { margin-top: 5px; display: flex; justify-content: center; align-items: center; gap: 15px; flex-shrink: 0; }
+        .counter-badge { font-weight: bold; font-size: 1.1em; color: #333; background: #eee; padding: 5px 10px; border-radius: 15px; }
+        .close-hint { text-align: center; margin-top: 5px; color: #776; font-size: .85em; flex-shrink: 0; }
+
+        /* ── 載入中遮罩 ── */
+        #loadingMask { display: none; position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+                       background: rgba(255,255,255,.8); z-index: 10; align-items: center; justify-content: center; font-size: 1.1em; color: #555; }
+
+        /* ── 說明區塊 ── */
+        .instructions { max-width: 800px; margin: 40px auto 0; background: #fff3cd; border-left: 5px solid #ffc107; padding: 20px; border-radius: 4px; }
+        .instructions h3 { margin-top: 0; color: #856404; }
+        .instructions ul { padding-left: 20px; line-height: 1.6; }
+        .instructions a { color: #0056b3; text-decoration: none; }
+        .instructions a:hover { text-decoration: underline; }
+
+        /* ── 十字線游標 ── */
+        .chart-wrap { cursor: crosshair; }
+    </style>
+</head>
+<body>
+
+<div class="control-panel">
+    <h2>股權分散表自訂查詢系統</h2>
+    <p style="color:#666;font-size:.9em;">請在下方輸入股票代號（每行一筆，可自帶名稱或逗號分隔，若僅輸入代號，系統會自動比對內建資料庫帶出名稱）：</p>
+    <textarea id="inputArea">2330    台積電
+2308    台達電
+2317    鴻海
+2454    聯發科
+3711    
+2891    中信金
+2345    智邦
+2383    
+2382    廣達
+2881    富邦金
+2882    國泰金
+2303    聯電
+3017    奇鋐
+2360    致茂
+2887    台新新光金
+2412    中華電
+2884    玉山金
+2885    元大金
+2886    兆豐金
+2890    永豐金
+2357    華碩
+3231    緯創
+2327    國巨*
+1303    南亞
+1216    統一
+6669    緯穎
+3653    健策
+2880    華南金
+2892    第一金
+2883    凱基金
+2368    金像電
+2449    京元電子
+2344    華邦電
+2301    光寶科
+5880    合庫金
+2408    南亞科
+2603    長榮
+2002    中鋼
+3008    大立光
+3661    世芯-KY
+7769    鴻勁
+1301    台塑
+2059    川湖
+4904    遠傳
+3045    台灣大
+2395    研華
+2207    和泰車
+6919    康霈*
+6505    台塑化</textarea>
+    <div style="margin-top:10px;display:flex;justify-content:flex-end;gap:10px;">
+        <button onclick="resetTo0050()" style="background:#6c757d;">重置回到0050成分股代號</button>
+
+        <button onclick="processInput()">產生股票表格</button>
+    </div>
+
+    <details class="group-panel" id="customGroupPanel">
+        <summary>自訂群組</summary>
+        <div class="group-list" id="customGroupList"></div>
+    </details>
+
+    <div style="margin-top:12px;display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap;">
+        <button onclick="startNewGroup()" style="background:#6f42c1;">增加群組</button>
+    </div>
+    <div class="group-editor" id="groupEditor">
+        <input type="text" id="groupNameInput" placeholder="群組名稱" oninput="updateSaveGroupButton()">
+        <button id="saveGroupButton" onclick="saveCurrentGroup()" style="display:none;background:#28a745;">儲存群組</button>
+    </div>
+</div>
+
+<div class="nav-container" id="topNav">
+    <button onclick="changePage(-1)">上一頁</button>
+    <span id="pageIndicatorTop" style="margin:0 15px;font-weight:bold;"></span>
+    <button onclick="changePage(1)">下一頁</button>
+</div>
+
+<div class="table-container" id="tableWrapper"></div>
+
+<div class="nav-container" id="bottomNav">
+    <button onclick="changePage(-1)">上一頁</button>
+    <span id="pageIndicatorBottom" style="margin:0 15px;font-weight:bold;"></span>
+    <button onclick="changePage(1)">下一頁</button>
+</div>
+
+<!-- ── Modal ── -->
+<div id="modal" onclick="closeModal(event)">
+    <div class="modal-content" onclick="event.stopPropagation()">
+        <h3 id="modalTitle" style="margin:0 0 10px 0; flex-shrink:0;"></h3>
+
+        <!-- 載入遮罩 -->
+        <div id="loadingMask" style="display:flex;">
+            <span id="loadingText">資料載入中…</span>
+        </div>
+
+        <!-- 圖1：散戶人數 + 大戶比例 -->
+        <div class="chart-title" id="ownershipTitle"></div>
+        <div class="chart-wrap">
+            <canvas id="ownershipChart"></canvas>
+        </div>
+
+        <!-- 圖2：週K線 -->
+        <div class="chart-title" id="candleTitle"></div>
+        <div class="chart-wrap">
+            <canvas id="candleChart"></canvas>
+        </div>
+
+        <div class="modal-nav">
+            <button onclick="navigateImg(-1)">上一檔</button>
+            <span class="counter-badge" id="imgCounter">0 / 0</span>
+            <button onclick="navigateImg(1)">下一檔</button>
+            <button onclick="openTrafficLight()" style="background:#28a745;">紅綠燈</button>
+        </div>
+        <div class="close-hint">💡 提示：按【ESC鍵】或點擊背景關閉視窗</div>
+    </div>
+</div>
+
+<!-- 說明區塊 -->
+<div class="instructions">
+    <h3>📖 系統使用說明</h3>
+
+    <h3>啟動網頁時</h3>
+    <ul>
+        <li>系統會先讀取瀏覽器 localStorage 內的 customStockGroups。</li>
+        <li>若 customStockGroups 有資料，會依照群組 name 欄位由小到大排序，載入排序第一筆群組到文字輸入區，並自動產生股票表格。</li>
+        <li>若 customStockGroups 沒有資料，才會使用舊流程讀取 savedStockList；若 savedStockList 也沒有資料，則保留頁面預設清單。</li>
+        <li>自訂群組 Accordion 預設收起，展開後會看到已儲存群組，並依群組名稱排序顯示。</li>
+    </ul>
+
+    <h3>新增群組</h3>
+    <ul>
+        <li>按下「增加群組」。</li>
+        <li>在「群組名稱」輸入框填入群組名稱。</li>
+        <li>在股票清單文字區輸入股票代號與名稱，每行一筆資料。</li>
+        <li>按下「儲存 xxxxx 群組」後，資料會存入 customStockGroups，Accordion 內的群組清單會立即更新。</li>
+    </ul>
+
+    <h3>載入與修改群組</h3>
+    <ul>
+        <li>展開「自訂群組」Accordion，按下群組名稱按鈕即可載入該群組內容。</li>
+        <li>載入後系統會把群組內容放入文字輸入區，並自動執行「產生股票表格」。</li>
+        <li>若載入 A 群組後只修改股票清單、群組名稱仍為 A，按下儲存會更新 A 群組。</li>
+        <li>若載入 A 群組後把群組名稱改為 AB，按下儲存會保留 A 群組，並新增 AB 群組。</li>
+        <li>若儲存時輸入的群組名稱已存在，系統會詢問是否覆蓋既有群組。</li>
+    </ul>
+
+    <h3>刪除群組</h3>
+    <ul>
+        <li>展開「自訂群組」Accordion。</li>
+        <li>按下群組旁的「刪除」按鈕。</li>
+        <li>確認刪除後，該群組會從 customStockGroups 移除，Accordion 內的群組清單會立即更新。</li>
+    </ul>
+
+    <h3>股票表格與圖表</h3>
+    <ul>
+        <li><strong style="color:#c00;">⚠️ 重要提示：目前僅提供個股資料，不含 ETF。</strong></li>
+        <li>按下「產生股票表格」會把文字輸入區內容轉成雙排互動表格。</li>
+        <li>點擊表格中的股票項目，會開啟 Chart.js 圖表，顯示散戶持股人數、大戶持股比例與週K線。</li>
+        <li>圖表支援移動十字線，滑鼠移至資料點時會以 Tooltip 顯示詳細數據。</li>
+        <li>週K線圖採用台灣慣例：紅漲、綠跌。</li>
+    </ul>
+
+    <h3>資料儲存位置與檢查方式</h3>
+    <p>資料存在瀏覽器的 localStorage，也就是「使用者目前這個瀏覽器、這個網址來源」底下的本機儲存空間，不會寫成實體檔案。</p>
+    <p>目前使用到兩個 key：</p>
+    <pre style="white-space:pre-wrap;line-height:1.6;background:#fff8dc;border:1px solid #f1df9a;padding:10px;border-radius:4px;">savedStockList       // 舊版自訂股票清單，僅作為沒有 customStockGroups 時的 fallback
+customStockGroups    // 目前自訂群組資料</pre>
+    <p>檢查方式：</p>
+    <ul>
+        <li>用瀏覽器開啟 tdccqryj.htm。</li>
+        <li>按 F12 開啟開發者工具。</li>
+        <li>到 Application 或「應用程式」分頁。</li>
+        <li>左側找 Local Storage (儲存空間)。</li>
+        <li>點選「本機儲存空間」下方目前頁面的來源。</li>
+        <li>找 savedStockList 與 customStockGroups。</li>
+    </ul>
+
+    <p style="margin-top: 15px; font-size: 0.95em; color: #555;">資料來源：<a href="https://www.tdcc.com.tw/portal/zh/smWeb/qryStock" target="_blank">集保戶股權分散表</a></p>
+</div>
+<script>
+// ════════════════════════════════════════════════════════
+//  台股代號資料庫（完整版，與原 tdccqry.htm 相同）
+// ════════════════════════════════════════════════════════
+const tsedb = {
+    "1101":"台泥","1102":"亞泥","1103":"嘉泥","1104":"環泥","1108":"幸福","1109":"信大","1110":"東泥",
+    "1201":"味全","1203":"味王","1210":"大成","1213":"大飲","1215":"卜蜂","1216":"統一","1217":"愛之味",
+    "1218":"泰山","1219":"福壽","1220":"台榮","1225":"福懋油","1227":"佳格","1229":"聯華","1231":"聯華食",
+    "1232":"大統益","1233":"天仁","1234":"黑松","1301":"台塑","1303":"南亞","1304":"台聚","1305":"華夏",
+    "1306":"台達化","1308":"亞聚","1309":"台達化","1310":"台苯","1312":"國喬","1313":"聯成","1314":"中石化",
+    "1319":"東陽","1326":"台化","1402":"遠東新","1409":"新纖","1434":"福懋","1444":"力麗","1476":"儒鴻",
+    "1477":"聚陽","1503":"士電","1504":"東元","1513":"中興電","1514":"亞力","1519":"華城","1521":"大億",
+    "1524":"耿鼎","1532":"勤美","1536":"和大","1558":"伸興","1560":"中砂","1563":"巧新","1590":"亞德客-KY",
+    "1597":"直得","1598":"岱宇","1603":"華電","1604":"聲寶","1605":"華新","1609":"大亞","1702":"南僑",
+    "1707":"葡萄王","1710":"東聯","1711":"永光","1712":"興農","1717":"長興","1718":"中纖","1720":"生達",
+    "1722":"台肥","1723":"中碳","1730":"花仙子","1731":"美吾華","1732":"毛寶","1733":"五鼎","1734":"杏輝",
+    "1736":"喬山","1737":"臺鹽","1752":"南光","1760":"寶齡富錦","1773":"勝一","1789":"神隆","1795":"美時",
+    "1802":"台玻","1810":"和成","1903":"士紙","1904":"正隆","1905":"華紙","1907":"永豐餘","1909":"榮成",
+    "2002":"中鋼","2006":"東和鋼鐵","2013":"中鋼構","2014":"中鴻","2015":"豐興","2027":"大成鋼",
+    "2049":"上銀","2059":"川湖","2062":"橋椿","2101":"南港","2103":"台橡","2104":"國際中橡","2105":"正新",
+    "2106":"建大","2201":"裕隆","2204":"中華","2206":"三陽工業","2207":"和泰車","2208":"台船","2227":"裕日車",
+    "2231":"為升","2301":"光寶科","2303":"聯電","2308":"台達電","2312":"金寶","2313":"華通","2317":"鴻海",
+    "2324":"仁寶","2327":"國巨*","2330":"台積電","2332":"友訊","2337":"旺宏","2344":"華邦電","2345":"智邦",
+    "2347":"聯強","2353":"宏碁","2354":"鴻準","2356":"英業達","2357":"華碩","2360":"致茂","2368":"金像電",
+    "2371":"大同","2376":"技嘉","2377":"微星","2379":"瑞昱","2382":"廣達","2383":"台光電","2385":"群光",
+    "2392":"正崴","2393":"億光","2395":"研華","2408":"南亞科","2409":"友達","2412":"中華電","2421":"建準",
+    "2423":"固緯","2427":"三商電","2428":"興勤","2430":"燦坤","2434":"統懋","2439":"美律","2441":"超豐",
+    "2449":"京元電子","2451":"創見","2454":"聯發科","2458":"義隆","2464":"盟立","2474":"可成","2478":"大毅",
+    "2480":"敦陽科","2481":"強茂","2492":"華新科","2498":"宏達電","2501":"國建","2504":"國產","2520":"冠德",
+    "2524":"京城","2530":"華建","2534":"宏盛","2535":"達欣工","2542":"興富發","2548":"華固","2597":"潤弘",
+    "2603":"長榮","2606":"裕民","2609":"陽明","2610":"華航","2615":"萬海","2618":"長榮航","2633":"台灣高鐵",
+    "2634":"漢翔","2637":"慧洋-KY","2702":"華園","2704":"國賓","2707":"晶華","2723":"美食-KY","2727":"王品",
+    "2731":"雄獅","2801":"彰銀","2812":"台中銀","2820":"華票","2832":"台產","2834":"臺企銀","2836":"高雄銀",
+    "2838":"聯邦銀","2845":"遠東銀","2850":"新產","2855":"統一證","2880":"華南金","2881":"富邦金",
+    "2882":"國泰金","2883":"凱基金","2884":"玉山金","2885":"元大金","2886":"兆豐金","2887":"台新新光金",
+    "2889":"國票金","2890":"永豐金","2891":"中信金","2892":"第一金","2897":"王道銀行","2903":"遠百",
+    "2912":"統一超","2915":"潤泰全","2945":"三商家購","3002":"歐格","3005":"神基","3006":"晶豪科",
+    "3008":"大立光","3010":"華立","3014":"聯陽","3015":"全漢","3016":"嘉晶","3017":"奇鋐","3019":"亞光",
+    "3023":"信邦","3026":"禾伸堂","3030":"德律","3034":"聯詠","3035":"智原","3036":"文曄","3037":"欣興",
+    "3042":"晶技","3044":"健鼎","3045":"台灣大","3051":"力特","3094":"聯傑","3105":"穩懋","3130":"一零四",
+    "3189":"景碩","3231":"緯創","3257":"虹冠電","3296":"勝德","3305":"昇貿","3311":"閎暉","3321":"同泰",
+    "3338":"泰碩","3356":"奇偶","3376":"新日興","3380":"明泰","3406":"玉晶光","3413":"京鼎","3419":"譁裕",
+    "3443":"創意","3481":"群創","3501":"維熹","3528":"安馳","3532":"台勝科","3533":"嘉澤","3545":"敦泰",
+    "3563":"牧德","3576":"聯合再生","3583":"辛耘","3592":"瑞鼎","3596":"智易","3607":"谷崧","3617":"碩天",
+    "3645":"達邁","3652":"精聯","3653":"健策","3661":"世芯-KY","3665":"貿聯-KY","3673":"TPK-KY",
+    "3694":"海華","3701":"大眾控","3702":"大聯大","3711":"日月光投控","3714":"富采","4104":"佳醫",
+    "4142":"國光生","4526":"東台","4532":"瑞智","4536":"拓凱","4540":"全球傳動","4551":"智伸科",
+    "4736":"泰博","4737":"華廣","4766":"南寶","4904":"遠傳","4906":"正文","4915":"致伸","4919":"新唐",
+    "4938":"和碩","4958":"臻鼎-KY","4961":"天鈺","4968":"立積","5203":"訊連","5269":"祥碩","5283":"禾聯碩",
+    "5306":"桂盟","5388":"中磊","5434":"崇越","5469":"瀚宇博","5471":"松翰","5871":"中租-KY",
+    "5876":"上海商銀","5880":"合庫金","6005":"群益證","6108":"競國","6116":"彩晶","6120":"達運",
+    "6121":"新普","6125":"廣運","6147":"頎邦","6153":"嘉聯益","6176":"瑞儀","6183":"關貿","6189":"豐藝",
+    "6196":"帆宣","6202":"盛群","6206":"飛捷","6213":"聯茂","6214":"精誠","6224":"聚鼎","6230":"尼得科超眾",
+    "6239":"力成","6257":"矽格","6269":"台郡","6271":"同欣電","6277":"宏正","6278":"台表科","6281":"全國電",
+    "6282":"康舒","6285":"啟碁","6409":"旭隼","6412":"群電","6414":"樺漢","6415":"矽力*-KY","6438":"迅得",
+    "6446":"藥華藥","6449":"鈺邦","6456":"GIS-KY","6464":"台數科","6472":"保瑞","6488":"環球晶",
+    "6491":"晶碩","6504":"南六","6505":"台塑化","6515":"穎崴","6526":"達發","6533":"晶心科","6552":"易華電",
+    "6569":"醫揚","6579":"研揚","6589":"台康生技","6592":"和潤企業","6605":"帝寶","6625":"必應",
+    "6641":"基士德-KY","6655":"科定","6668":"中揚光","6669":"緯穎","6670":"復盛應用","6689":"伊雲谷",
+    "6695":"芯鼎","6706":"惠特","6719":"力智","6742":"澤米","6756":"威鋒電子","7705":"三商餐飲",
+    "7721":"微程式","7750":"新代","7765":"中華資安","7769":"鴻勁","8016":"矽創","8028":"昇陽半導體",
+    "8033":"雷虎","8039":"台虹","8046":"南電","8070":"長華*","8072":"陞泰","8081":"致新","8086":"宏捷科",
+    "8103":"瀚荃","8110":"華東","8131":"福懋科","8150":"南茂","8163":"達方","8210":"勤誠","8213":"志超",
+    "8249":"菱光","8261":"富鼎","8341":"日友","8374":"羅昇","8454":"富邦媒","8462":"柏文","8464":"億豐",
+    "8478":"東哥遊艇","8488":"吉源-KY","8926":"台汽電","8940":"新天地","8996":"高力","9802":"鈺齊-KY",
+    "9904":"寶成","9910":"豐泰","9911":"櫻花","9914":"美利達","9917":"中保科","9921":"巨大","9924":"福興",
+    "9925":"新保","9929":"秋雨","9933":"中鼎","9934":"成霖","9937":"全國","9939":"宏全","9940":"信義",
+    "9941":"裕融","9945":"潤泰新","9951":"皇田","9958":"世紀鋼",
+    // 上櫃
+    "6919":"康霈*","1240":"茂生農經","1264":"德麥","1268":"漢來美食","1565":"精華","1580":"新麥",
+    "1584":"精剛","1586":"和勤","1593":"祺驊","1595":"川寶","1599":"宏佳騰","1784":"訊聯","1785":"光洋科",
+    "1788":"杏昌","2061":"風青","2063":"世鎧","2064":"晉椿","2066":"世德","2640":"大車隊","2643":"捷迅",
+    "2723":"美食-KY","2729":"瓦城","2732":"六角","2751":"王座","2753":"八方雲集","3066":"李洲","3071":"協禧",
+    "3078":"僑威","3081":"聯亞","3085":"新零售","3088":"艾訊","3095":"及成","3114":"好德","3122":"笙泉",
+    "3128":"昇銳","3131":"弘塑","3141":"晶宏","3152":"璟德","3158":"嘉實","3163":"波若威","3169":"亞信",
+    "3176":"基亞","3178":"公準","3188":"鑫龍騰","3205":"佰研","3206":"志豐","3207":"耀勝","3211":"順達",
+    "3213":"茂訊","3217":"優群","3219":"倚強科","3221":"台嘉碩","3224":"三顧","3227":"原相","3228":"金麗科",
+    "3230":"錦明","3232":"昱捷","3234":"光環","3236":"千如","3259":"鑫創","3260":"威剛","3264":"欣銓",
+    "3272":"東碩","3284":"太普高","3285":"微端","3287":"廣寰科","3288":"點晶","3289":"宜特","3293":"鈊象",
+    "3297":"杭特","3305":"昇貿","3306":"鼎天","3310":"佳穎","3313":"斐成","3317":"尼克森","3322":"建舜電",
+    "3323":"加百裕","3324":"雙鴻","3332":"幸康","3339":"泰谷","3349":"寶德","3354":"律勝","3360":"尚立",
+    "3362":"先進光","3363":"上詮","3372":"典範","3373":"熱映","3374":"精材","3388":"崇越電","3390":"旭軟",
+    "3402":"漢科","3430":"奇鈦科","3434":"哲固","3438":"類比科","3441":"聯一光","3444":"利機","3455":"由田",
+    "3466":"德晉","3479":"安勤","3483":"力致","3484":"崧騰","3491":"昇達科","3492":"長盛","3498":"陽程",
+    "3499":"環天科","3508":"位速","3515":"華擎","3516":"亞帝歐","3518":"柏騰","3520":"華盈","3522":"御嵿",
+    "3523":"迎輝","3526":"凡甲","3527":"聚積","3529":"力旺","3531":"先益","3537":"堡達","3540":"曜越",
+    "3541":"西柏","3546":"宇峻","3548":"兆利","3551":"世禾","3552":"同致","3558":"神準","3563":"牧德",
+    "3567":"逸昌","3577":"泓格","3580":"友威科","3587":"閎康","3597":"映興","3611":"鼎翰","3615":"安可",
+    "3623":"富晶通","3624":"光頡","3628":"盈正","3630":"新鉅科","3631":"晟楠","3632":"研勤","3646":"艾恩特",
+    "3663":"鑫科","3664":"安瑞-KY","3675":"德微","3680":"家登","3684":"榮昌","3685":"元創精密","3691":"碩禾",
+    "3693":"營邦","3709":"鑫聯大投控","3710":"連展投控","4102":"永日","4105":"東洋","4107":"邦特",
+    "4113":"聯上","4114":"健喬","4120":"友華","4121":"優盛","4123":"晟德","4126":"太醫","4128":"中天",
+    "4129":"聯合","4130":"健亞","4138":"曜亞","4147":"中裕","4153":"鈺緯","4162":"智擎","4163":"鐿鈦",
+    "4166":"友霖","4171":"瑞基","4173":"久裕","4174":"浩鼎","4175":"杏一","4192":"杏國","4205":"中華食",
+    "4303":"信立","4304":"勝昱","4401":"東隆興","4416":"三圓","4432":"銘旺實","4433":"興采","4502":"健信",
+    "4503":"金雨","4506":"崇友","4510":"高鋒","4513":"福裕","4523":"永彰","4528":"江興鍛","4533":"協易機",
+    "4536":"拓凱","4540":"全球傳動","4549":"桓達","4550":"長佳","4554":"橙的","4561":"健椿","4563":"百德",
+    "4568":"科際精密","4702":"中美實","4706":"大恭","4711":"永純","4721":"美琪瑪","4726":"永昕",
+    "4728":"雙美","4735":"豪展","4741":"泓瀚","4743":"合一","4744":"皇將","4747":"強生","4749":"新應材",
+    "4754":"國碳科","4760":"勤凱","4772":"台特化","4903":"聯光通","4907":"富宇","4908":"前鼎","4911":"德英",
+    "4919":"新唐","4923":"力士","4931":"新盛力","4933":"友輝","4939":"亞電","4946":"辣椒","4953":"緯軟",
+    "4966":"譜瑞-KY","4972":"湯石照明","4973":"廣穎","4974":"亞泰","4979":"華星光","4991":"環宇-KY",
+    "5009":"榮剛","5201":"凱衛","5205":"中茂","5209":"新鼎","5210":"寶碩","5213":"亞昕","5223":"安力-KY",
+    "5227":"立凱-KY","5228":"鈺鎧","5236":"凌陽創新","5245":"智晶","5263":"智崴","5272":"笙科",
+    "5274":"信驊","5278":"尚凡*","5289":"宜鼎","5291":"邑昇","5299":"杰力","5302":"太欣","5309":"系統電",
+    "5315":"光聯","5324":"士開","5347":"世界","5351":"鈺創","5356":"協益","5371":"中光電","5388":"中磊",
+    "5392":"能率","5410":"國眾","5425":"台半","5434":"崇越","5438":"東友","5443":"均豪","5450":"南良",
+    "5464":"霖宏","5465":"富驊","5468":"凱鈺","5474":"聰泰","5478":"智冠","5483":"中美晶","5487":"通泰",
+    "5490":"同亨","5493":"三聯","5508":"永信建","5511":"德昌","5512":"力麒","5530":"龍巖","5536":"聖暉*",
+    "5547":"久舜","5548":"安倉","5701":"劍湖山","5864":"致和證","5878":"台名","5902":"德記","5903":"全家",
+    "5904":"寶雅","6015":"宏遠證","6020":"大展證","6101":"寬魚國際","6104":"創惟","6113":"亞矽",
+    "6121":"新普","6122":"擎邦","6124":"業強","6128":"上福","6134":"萬旭","6138":"茂達","6143":"振曜",
+    "6146":"耕興","6148":"驊宏資","6150":"撼訊","6156":"松上","6158":"禾昌","6160":"欣技","6163":"華電網",
+    "6169":"昱泉","6173":"信昌電","6174":"安碁","6175":"立敦","6179":"亞通","6180":"橘子","6182":"合晶",
+    "6187":"萬潤","6188":"廣明","6190":"萬泰科","6194":"育富","6197":"佳必琪","6202":"盛群","6205":"詮欣",
+    "6207":"雷科","6208":"日揚","6213":"聯茂","6215":"和椿","6216":"居易","6221":"晉泰","6222":"立軒",
+    "6223":"旺矽","6229":"研通","6231":"系微","6233":"旺玖","6234":"高僑","6237":"驊訊","6241":"鑫永洋",
+    "6242":"立康","6244":"茂迪","6248":"沛波","6257":"矽格","6261":"久元","6263":"普萊德","6265":"方土昶",
+    "6274":"台燿","6275":"元山","6279":"胡連","6284":"佳邦","6290":"良維","6411":"晶焱","6418":"詠昇",
+    "6419":"京晨科","6423":"億而得","6425":"易發","6435":"大中","6441":"廣錠","6461":"益得","6462":"神盾",
+    "6465":"威潤","6469":"大樹","6472":"保瑞","6477":"安集","6482":"弘煜科","6491":"晶碩","6492":"生華科",
+    "6494":"九齊","6499":"益安","6506":"雙邦","6508":"惠光","6509":"聚和","6510":"精測","6516":"勤崴國際",
+    "6523":"達爾膚","6527":"明達醫","6530":"創威","6535":"順藥","6538":"倉和","6547":"高端疫苗",
+    "6556":"勝品","6561":"是方","6570":"維田","6574":"霈方","6576":"逸達","6577":"勁豐","6584":"南俊國際",
+    "6589":"台康生技","6590":"普鴻","6591":"動力-KY","6596":"寬宏藝術","6597":"立誠","6603":"富強鑫",
+    "6609":"瀧澤科","6613":"朋億*","6617":"共信-KY","6620":"漢達","6625":"必應","6637":"醫影","6640":"均華",
+    "6642":"富致","6643":"M31","6651":"全宇昕","6661":"威健生技","6662":"樂斯科","6664":"群翊","6667":"信紘科",
+    "6683":"雍智科技","6684":"安格","6690":"安碁資訊","6693":"廣閎科","6712":"長聖","6716":"應廣",
+    "6719":"力智","6721":"信實","6732":"昇佳電子","6733":"博晟生醫","6739":"竹陞科技","6741":"91APP*-KY",
+    "6751":"智聯服務","6752":"叡揚","6761":"穩得","6767":"台微醫","6785":"昱展新藥","6788":"華景電",
+    "6791":"虎門科技","6803":"崑鼎","6811":"宏碁資訊","6821":"聯寶","6823":"濾能","6840":"東研信超",
+    "6841":"長佳智能","6843":"進典","6846":"綠茵","6856":"鑫傳","6859":"伯特光","6865":"偉康科技",
+    "6870":"騰雲","6872":"浩宇生醫","6874":"倍力","6877":"鏵友益","6881":"潤德","6884":"海柏特",
+    "6894":"衛司特","6899":"創為精密","6903":"巨漢","6907":"雅特力-KY","6910":"德鴻","6913":"鴻呈",
+    "6922":"宸曜","6925":"意藍","6929":"佑全","6953":"家碩","6968":"萬達寵物","6982":"大井泵浦",
+    "7402":"邑錡","7703":"銳澤","7708":"全家餐飲","7709":"榮田","7712":"博盛半導體","7715":"裕山",
+    "7718":"友鋮","7723":"築間","7744":"崴寶","7751":"HB","7753":"星亞","7769":"鴻勁","7770":"君曜",
+    "7772":"耀穎","7782":"光速火箭","7792":"安葆","7794":"宏碁智新","7805":"威聯通","7819":"精誠金融",
+    "7820":"立盈","8024":"佑華","8027":"鈦昇","8032":"光菱","8034":"榮群","8038":"長園科","8040":"九暘",
+    "8042":"金山電","8043":"蜜望實","8044":"網家","8047":"星雲","8049":"晶采","8050":"廣積","8054":"安國",
+    "8059":"凱碩","8064":"東捷","8066":"來思達","8067":"志旭","8068":"全達","8069":"元太","8074":"鉅橡",
+    "8076":"伍豐","8080":"泰霖","8083":"瑞穎","8085":"福華","8086":"宏捷科","8088":"品安","8091":"翔名",
+    "8092":"建暐","8093":"保銳","8097":"常珵","8099":"大世科","8109":"博大","8111":"立碁","8121":"越峰",
+    "8147":"正淩","8155":"博智","8171":"天宇","8176":"智捷","8182":"加高","8234":"新漢","8240":"華宏",
+    "8255":"朋程","8272":"全景軟體","8279":"生展","8284":"三竹","8291":"尚茂","8299":"群聯","8342":"益張",
+    "8349":"恒耀","8354":"冠好","8358":"金居","8383":"千附","8390":"金益鼎","8401":"白紗科","8403":"盛弘",
+    "8410":"森田","8415":"大國鋼","8416":"實威","8421":"旭源","8424":"惠普","8431":"匯鑽科","8432":"東生華",
+    "8436":"大江","8440":"綠電","8444":"綠河-KY","8446":"華研","8450":"霹靂","8454":"富邦媒","8462":"柏文",
+    "8464":"億豐","8472":"夠麻吉","8477":"創業家","8905":"裕國","8906":"花王","8908":"欣雄","8916":"光隆",
+    "8917":"欣泰","8921":"沈氏","8923":"時報","8924":"大田","8927":"北基","8928":"鉅明","8929":"富堡",
+    "8930":"青鋼","8931":"大汽電","8933":"愛地雅","8935":"邦泰","8936":"國統","8938":"明安","8940":"新天地",
+    "8941":"關中","8942":"森鉅","9949":"琉園","9950":"萬國通","9951":"皇田","9960":"邁達康","9962":"有益"
+};
+
+// ════════════════════════════════════════════════════════
+//  API 端點設定（與 StockChart.aspx 同目錄部署時不需修改）
+// ════════════════════════════════════════════════════════
+// const API_URL = 'StockChart.aspx'; // Removed for static JSON
+
+// ════════════════════════════════════════════════════════
+//  狀態變數
+// ════════════════════════════════════════════════════════
+let stockList    = [];
+let currentPage  = 0;
+let currentIndex = 0;
+let chartOwnership = null;
+let chartCandle    = null;
+
+// ════════════════════════════════════════════════════════
+//  1. 解析輸入區文字 → 產生股票清單 (stockList)
+// ════════════════════════════════════════════════════════
+function processInput() {
+    const text  = document.getElementById('inputArea').value;
+    stockList   = []; // 清空舊的清單
+
+    // 逐行解析輸入框的內容
+    text.split('\n').forEach(line => {
+        const trimmed = line.trim();
+        if (!trimmed) return; // 忽略空行
+        
+        // 用空白或逗號將代號與名稱切開
+        const parts   = trimmed.split(/[\s,]+/);
+        if (!parts[0]) return;
+        
+        const code    = parts[0].trim();
+        // 將代號後面的所有文字組合成名稱
+        const extracted = parts.slice(1).join(' ').trim();
+        
+        // 建立股票物件，若使用者沒輸入名稱，自動從內建的 tsedb 資料庫中尋找
+        stockList.push({
+            id:   code,
+            name: extracted || tsedb[code] || '未知股票'
+        });
+    });
+
+    if (!stockList.length) { alert('未偵測到有效的股票代號，請重新輸入！'); return; }
+
+    // 解析成功後，重置頁碼並渲染表格
+    currentPage = 0;
+    renderTable();
+
+    // 如果股票數量超過 50 筆，顯示分頁導覽列
+    const needNav = stockList.length > 50;
+    document.getElementById('topNav').style.display    = needNav ? 'block' : 'none';
+    document.getElementById('bottomNav').style.display = needNav ? 'block' : 'none';
+}
+
+// ════════════════════════════════════════════════════════
+//  2. 渲染雙排股票清單表格 (支援分頁)
+// ════════════════════════════════════════════════════════
+function renderTable() {
+    const wrapper    = document.getElementById('tableWrapper');
+    wrapper.innerHTML = '';
+
+    // 每頁顯示 50 筆資料 (分為左右兩排，各 25 筆)
+    const start      = currentPage * 50;
+    const pageData   = stockList.slice(start, start + 50);
+    const totalPages = Math.ceil(stockList.length / 50);
+    
+    // 更新上下導覽列的頁碼文字
+    const pageText   = `第 ${currentPage + 1} / ${totalPages} 頁 (共 ${stockList.length} 檔)`;
+    document.getElementById('pageIndicatorTop').innerText    = pageText;
+    document.getElementById('pageIndicatorBottom').innerText = pageText;
+
+    // 將 50 筆資料拆成兩個 Table (i=0 為左排, i=1 為右排)
+    for (let i = 0; i < 2; i++) {
+        const sliceData = pageData.slice(i * 25, (i + 1) * 25);
+        if (!sliceData.length && i > 0) break; // 如果右排沒資料就跳出
+
+        let html = `<table><tr><th>股票代號</th><th>股票名稱</th></tr>`;
+        sliceData.forEach((item, idx) => {
+            // 計算該筆資料在全域 stockList 中的真實索引 (gIdx)
+            const gIdx = start + i * 25 + idx;
+            // 綁定點擊事件，開啟對應索引的圖表
+            html += `<tr onclick="openModal(${gIdx})">
+                        <td><strong>${item.id}</strong></td>
+                        <td>${item.name}</td>
+                     </tr>`;
+        });
+        html += `</table>`;
+        wrapper.innerHTML += html;
+    }
+}
+
+// ════════════════════════════════════════════════════════
+//  3. 開啟 Modal → 呼叫 API 取得 JSON 資料 → 繪圖
+// ════════════════════════════════════════════════════════
+function openModal(idx) {
+    currentIndex = idx;
+    const stock  = stockList[idx];
+
+    // 更新 Modal UI 標題與計數器
+    document.getElementById('modalTitle').innerText  = `${stock.id} - ${stock.name}`;
+    document.getElementById('imgCounter').innerText  = `${idx + 1} / ${stockList.length}`;
+    document.getElementById('ownershipTitle').innerText = '';
+    document.getElementById('candleTitle').innerText    = '';
+    
+    // 顯示 Modal 視窗並捲動到最頂部
+    document.getElementById('modal').style.display      = 'flex';
+    document.getElementById('modal').scrollTop          = 0;
+
+    // 開啟載入中遮罩
+    showLoading(true);
+
+    // 呼叫靜態 JSON 檔案取得股票資料
+    fetch(`https://mickyang12.github.io/TDChart/tdccjson/tdcc_${encodeURIComponent(stock.id)}.json`)
+        .then(r => r.json())
+        .then(data => {
+            showLoading(false); // 關閉載入中遮罩
+            if (!data.success) { alert('資料讀取失敗：' + (data.error || '未知錯誤')); return; }
+            
+            // 從 JSON 取出股票名稱，以確保名稱為最新
+            if (data.stockName) {
+                stock.name = data.stockName;
+                document.getElementById('modalTitle').innerText  = `${stock.id} - ${stock.name}`;
+                
+                // 同步更新背後表格的文字
+                const rows = document.querySelectorAll('#tableWrapper tr');
+                for (let r of rows) {
+                    if (r.onclick && r.onclick.toString().includes(`openModal(${idx})`)) {
+                        r.cells[1].innerText = stock.name;
+                    }
+                }
+            }
+            
+            // 資料取得成功，將資料交由繪圖核心處理
+            renderCharts(stock, data);
+        })
+        .catch(err => {
+            showLoading(false);
+            alert('API 連線失敗：' + err.message);
+        });
+}
+
+// 顯示或隱藏載入中遮罩
+function showLoading(on) {
+    document.getElementById('loadingMask').style.display = on ? 'flex' : 'none';
+}
+
+// ════════════════════════════════════════════════════════
+//  4. Chart.js 繪圖核心
+// ════════════════════════════════════════════════════════
+function renderCharts(stock, data) {
+        // 設定兩張圖表的標題
+        document.getElementById('ownershipTitle').innerText = `${stock.id} ${stock.name} 大戶與散戶持股`;
+        document.getElementById('candleTitle').innerText    = `${stock.id} ${stock.name} 週K線圖`;
+
+        // 將日期字串 (yyyy-MM-dd) 統一轉換為 Timestamp (毫秒)，供 Chart.js timeseries 使用
+        const toTs = d => new Date(d + 'T00:00:00').getTime();
+        
+        // 收集兩張圖表所有的日期 Timestamp，以確保兩張圖在 X 軸的時間基準完全一致
+        const allTs = [
+            ...data.ownership.map(r => toTs(r.d)),
+            ...data.weeklyK.map(r => toTs(r.d))
+        ];
+        const xMin = Math.min(...allTs); // 計算 X 軸起點
+        const xMax = Math.max(...allTs); // 計算 X 軸終點
+
+        // ════════════════════════════════════════════════════════
+        // 手動產生共用的 X 軸刻度 (Ticks)
+        // 解決 chartjs-chart-financial 與一般圖表的 autoSkip 計算邏輯不一致的問題，
+        // 確保上下兩張圖的日期標籤頻率 100% 相同，並且絕對會顯示最後一天。
+        // ════════════════════════════════════════════════════════
+        // 1. 取得所有不重複且排序過的日期 Timestamp
+        const uniqueTs = Array.from(new Set(allTs)).sort((a, b) => a - b);
+        
+        // 2. 設定畫面最多大約容納 40 個標籤（避免文字重疊）
+        const maxTicks = 40; 
+        
+        // 3. 計算抽樣步長 (step)，例如 step=2 代表每兩個日期挑一個顯示
+        const step = Math.max(1, Math.floor(uniqueTs.length / maxTicks));
+        const sharedXTicks = [];
+        for (let i = 0; i < uniqueTs.length; i += step) {
+            sharedXTicks.push({ value: uniqueTs[i] });
+        }
+        
+        // 4. 強制把最新的最後一天加入標籤陣列，確保圖表最右側有日期可看
+        if (sharedXTicks.length > 0 && sharedXTicks[sharedXTicks.length - 1].value !== uniqueTs[uniqueTs.length - 1]) {
+            sharedXTicks.push({ value: uniqueTs[uniqueTs.length - 1] });
+        }
+
+        // 5. 將計算好的共用 X 軸刻度，分別傳給兩張圖表的繪製函式
+        drawOwnershipChart(data.ownership, xMin, xMax, sharedXTicks);
+        drawCandleChart(data.weeklyK, xMin, xMax, sharedXTicks);
+    }
+
+
+// ── 4-1. 散戶人數 + 大戶持股比例（上方圖表）──────────────
+function drawOwnershipChart(rows, xMin, xMax, sharedXTicks) {
+    // 每次畫圖前先銷毀舊的實例，避免記憶體洩漏與畫面重疊
+    if (chartOwnership) { chartOwnership.destroy(); chartOwnership = null; }
+
+    const toTs = d => new Date(d + 'T00:00:00').getTime();
+    const dates   = rows.map(r => r.d);
+    // 將資料格式化為 Chart.js 支援的 {x, y} 物件結構
+    const retail  = rows.map(r => ({ x: toTs(r.d), y: r.rc })); // rc: Retail Count (散戶人數)
+    const big400  = rows.map(r => ({ x: toTs(r.d), y: parseFloat(r.b4) })); // b4: Big 400 (400張大戶)
+    const big1000 = rows.map(r => ({ x: toTs(r.d), y: parseFloat(r.b10) })); // b10: Big 1000 (1000張大戶)
+
+    // 產生交替的月份背景顏色區塊與跨年分割線
+    const bgAnnotations   = buildAnnotsByDates(dates);
+    const yearAnnotations = buildYearAnnotsByDates(dates);
+    const allAnnotations  = { ...bgAnnotations, ...yearAnnotations };
+
+    const ctx = document.getElementById('ownershipChart').getContext('2d');
+    chartOwnership = new Chart(ctx, {
+        data: {
+            datasets: [
+                {
+                    type: 'bar', // 散戶持股使用長條圖
+                    label: '散戶持股人數',
+                    data: retail,
+                    backgroundColor: 'rgba(173,216,230,0.7)',
+                    borderColor:     'rgba(100,160,200,0.8)',
+                    borderWidth: 0.5,
+                    yAxisID: 'yLeft', // 綁定到左側 Y 軸
+                    order: 2 // 渲染順序：數值越大越先畫 (會被壓在底層)
+                },
+                {
+                    type: 'line', // 大戶 400 張使用折線圖
+                    label: '大戶持股比例_400張',
+                    data: big400,
+                    borderColor: 'rgba(220,30,30,0.9)',
+                    backgroundColor: 'transparent',
+                    borderWidth: 2,
+                    pointRadius: 0, // 平時隱藏資料點，畫面更乾淨
+                    pointHoverRadius: 4, // 滑鼠移上去才顯示資料點
+                    tension: 0.2, // 線條平滑度 (貝茲曲線)
+                    yAxisID: 'yRight', // 綁定到右側 Y 軸
+                    order: 1 // 渲染順序：數值越小越晚畫 (會蓋在頂層)
+                },
+                {
+                    type: 'line', // 大戶 1000 張使用折線圖
+                    label: '大戶持股比例_1000張',
+                    data: big1000,
+                    borderColor: 'rgba(30,140,30,0.9)',
+                    backgroundColor: 'transparent',
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    pointHoverRadius: 4,
+                    tension: 0.2,
+                    yAxisID: 'yRight',
+                    order: 1
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false, // 允許設定固定高度 (380px) 而不受比例限制
+            layout: { padding: { left: 0, right: 0 } },
+            interaction: { mode: 'index', intersect: false }, // 滑鼠不用精準指在線上，只要在同個 X 軸(index) 就會觸發 Tooltip
+            plugins: {
+                legend: {
+                    position: 'top',
+                    labels: { font: { family: 'Microsoft JhengHei', size: 12 }, boxWidth: 20 }
+                },
+                tooltip: {
+                    callbacks: {
+                        // 客製化 Tooltip 標籤文字格式
+                        label: ctx => {
+                            if (ctx.dataset.label === '散戶持股人數')
+                                return ` 散戶持股人數：${ctx.parsed.y.toLocaleString()} 人`;
+                            return ` ${ctx.dataset.label}：${ctx.parsed.y.toFixed(2)} %`;
+                        }
+                    }
+                },
+                annotation: { annotations: allAnnotations }
+            },
+            scales: {
+                x: {
+                    type: 'timeseries', // 時間序列軸
+                    min: xMin, // 固定起點
+                    max: xMax, // 固定終點
+                    time: { 
+                        unit: 'week', 
+                        tooltipFormat: 'yyyy-MM-dd',
+                        displayFormats: { week: 'yyyy-MM-dd' }
+                    },
+                    afterBuildTicks: axis => {
+                        // 【關鍵】強制使用 renderCharts 計算出來的 sharedXTicks，覆蓋掉原生演算法
+                        axis.ticks = sharedXTicks.map(t => ({...t}));
+                    },
+                    ticks: {
+                        autoSkip: false, // 【關鍵】停用 Chart.js 自動省略功能，完全由上方邏輯掌控顯示頻率
+                        maxRotation: 90, // 文字旋轉 90 度 (直排)
+                        minRotation: 90,
+                        font: { size: 10 }
+                    }
+                },
+                yLeft: {
+                    type: 'linear',
+                    position: 'left',
+                    grace: '10%', // 【關鍵】讓資料最高點到圖表頂部之間，自動保留 10% 的空白緩衝區，避免資料貼齊頂部
+                    title: {
+                        display: true,
+                        text: '散戶持股人數',
+                        color: 'steelblue',
+                        font: { family: 'Microsoft JhengHei', size: 12 }
+                    },
+                    ticks: {
+                        // 將 1000 轉換為 1k，節省 Y 軸空間
+                        callback: v => v >= 1000 ? (v/1000).toFixed(0) + 'k' : v
+                    },
+                    // 【重點對齊技巧】強制左 Y 軸的寬度為 80px，這能保證跟下圖的對齊基準點一致
+                    afterFit: (scale) => { scale.width = 80; } 
+                },
+                yRight: {
+                    type: 'linear',
+                    position: 'right',
+                    grace: '10%', // 讓頂部保留 10% 空間
+                    title: {
+                        display: true,
+                        text: '大戶持股比例 (%)',
+                        color: 'crimson',
+                        font: { family: 'Microsoft JhengHei', size: 12 }
+                    },
+                    grid: { drawOnChartArea: false }, // 關閉右側 Y 軸的網格線，避免畫面網格雜亂交錯
+                    afterFit: (scale) => { scale.width = 80; } // 強制右 Y 軸寬度 80px
+                }
+            }
+        },
+        plugins: [crosshairPlugin] // 載入自訂的十字游標聯動外掛
+    });
+}
+
+// ── 4-2. 週K線圖（下方圖表）───────────────────────────────
+function drawCandleChart(rows, xMin, xMax, sharedXTicks) {
+    // 每次畫圖前先銷毀舊的實例
+    if (chartCandle) { chartCandle.destroy(); chartCandle = null; }
+
+    const toTs  = d => new Date(d + 'T00:00:00').getTime();
+    const dates = rows.map(r => r.d);
+    
+    // 轉換成 chartjs-chart-financial 需要的 ohlc 資料格式：x(時間), o(開), h(高), l(低), c(收)
+    const ohlcData = rows.map(r => ({
+        x: toTs(r.d),
+        o: parseFloat(r.o),
+        h: parseFloat(r.h),
+        l: parseFloat(r.l),
+        c: parseFloat(r.c)
+    })).filter(d => 
+        // 確保沒有 NaN 等無效資料，否則會導致整個 K 線圖掛掉
+        Number.isFinite(d.x) &&
+        Number.isFinite(d.o) &&
+        Number.isFinite(d.h) &&
+        Number.isFinite(d.l) &&
+        Number.isFinite(d.c)
+    );
+
+    // 計算 K 線的最高點與最低點，作為 Y 軸的極值依據
+    const lows  = ohlcData.map(d => d.l);
+    const highs = ohlcData.map(d => d.h);
+    const yMin  = lows.length  ? Math.min(...lows)  : 0;
+    const yMax  = highs.length ? Math.max(...highs) : 1;
+
+    // 產生交替的月份背景顏色區塊與跨年分割線
+    const bgAnnotations   = buildAnnotsByDates(dates);
+    const yearAnnotations = buildYearAnnotsByDates(dates);
+    const allAnnotations  = { ...bgAnnotations, ...yearAnnotations };
+
+    const ctx = document.getElementById('candleChart').getContext('2d');
+    chartCandle = new Chart(ctx, {
+        type: 'candlestick', // 套用 chartjs-chart-financial 的專屬圖表類型
+        data: {
+            datasets: [{
+                label: '週K',
+                data: ohlcData,
+                barPercentage: 0.75, // K棒的寬度比例
+                categoryPercentage: 0.9 // 分類的寬度比例
+            }]
+        },
+        options: {
+            elements: {
+                candlestick: {
+                    // 套件底層是以「像素 Y 座標」判斷。Y 座標越小代表股價越高。
+                    // close < open 代表收盤在上方（上漲），套用 `.up`；反之套用 `.down`。
+                    backgroundColors: {
+                        up: '#EF232A',       // 上漲（紅）
+                        down: '#09AA37',     // 下跌（綠）
+                        unchanged: '#888888'
+                    },
+                    borderColors: {
+                        up: '#EF232A',       // 上漲邊框（紅）
+                        down: '#09AA37',     // 下跌邊框（綠）
+                        unchanged: '#888888'
+                    }
+                }
+            },
+            responsive: true,
+            maintainAspectRatio: false,
+            layout: {
+                // 【重點對齊技巧】因為下方的 K 線圖「只有右側 Y 軸」，不像上方圖有左側 Y 軸撐起 80px 的寬度，
+                // 為了讓上下圖表的作圖區域 (chartArea) 的左邊界切齊，這裡強制在左側補上 80px 的 padding！
+                padding: { left: 80, right: 0 } 
+            },
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                legend: { display: false }, // K 線圖不需圖例
+                tooltip: {
+                    callbacks: {
+                        // 客製化 K 線 Tooltip，顯示開高低收
+                        label: ctx => {
+                            const d = ctx.raw;
+                            if (!d) return null;
+                            return [
+                                ` 開：${d.o}`,
+                                ` 高：${d.h}`,
+                                ` 低：${d.l}`,
+                                ` 收：${d.c}`
+                            ];
+                        }
+                    }
+                },
+                annotation: { annotations: allAnnotations }
+            },
+            scales: {
+                x: {
+                    type: 'timeseries',
+                    min: xMin,
+                    max: xMax,
+                    offset: true, // K 線圖頭尾需要留白，否則半根 K 棒會被切掉
+                    time: { 
+                        unit: 'week', 
+                        tooltipFormat: 'yyyy-MM-dd',
+                        displayFormats: { week: 'yyyy-MM-dd' }
+                    },
+                    afterBuildTicks: axis => {
+                        // 【關鍵】強制使用與上圖完全相同的 sharedXTicks 陣列
+                        axis.ticks = sharedXTicks.map(t => ({...t}));
+                    },
+                    ticks: {
+                        autoSkip: false, // 【關鍵】停用自動省略，套件原生的巨大 autoSkipPadding (75px) 就會失效
+                        maxRotation: 90,
+                        minRotation: 90,
+                        font: { size: 10 }
+                    }
+                },
+                y: {
+                    position: 'right',
+                    // 【關鍵】將最大值乘上 1.08 (增加 8% 的頂部留白)，最小值乘上 0.95 (增加 5% 底部留白)
+                    // 這樣 K 棒的高低點就不會死死的貼在圖表的上下邊緣，保留舒適的呼吸空間
+                    min: yMin * 0.95,
+                    max: yMax * 1.08,
+                    title: {
+                        display: true,
+                        text: '股價',
+                        font: { family: 'Microsoft JhengHei', size: 12 }
+                    },
+                    afterFit: (scale) => { scale.width = 80; } // 強制右 Y 軸寬度 80px，與上方圖表對齊
+                }
+            }
+        },
+        plugins: [crosshairPlugin] // 載入自訂的十字游標聯動外掛
+    });
+}
+
+
+// ── 4-3. Timestamp-based annotation 建構器（兩圖共用）──────────────
+// 功能：根據資料陣列的日期，產生 Chart.js Annotation 外掛所需的「交替月份背景色塊」設定
+function buildAnnotsByDates(dates) {
+    const toTs = d => new Date(d + 'T00:00:00').getTime();
+    const annotations = {};
+    if (!dates.length) return annotations;
+    
+    // 定義兩種深淺不同的背景色，用來區分月份
+    const colors = ['rgba(230,245,255,0.35)', 'rgba(200,230,255,0.35)'];
+    
+    // 將 "yyyy-MM" 轉為絕對數字以確保上下圖表的同月份必定取得同一個顏色
+    const getMonthAbs = (monthStr) => {
+        const parts = monthStr.split('-');
+        return parseInt(parts[0], 10) * 12 + parseInt(parts[1], 10);
+    };
+
+    let curMonth = dates[0].slice(0, 7); // 擷取 "yyyy-MM" 作為當前月份
+    let startTs  = toTs(dates[0]); // 記錄當前月份區塊的起始時間
+
+    // 負責將累積的月份時間區段轉為 Annotation Box 物件並寫入 annotations
+    const flush = (fromTs, toTs2, monthStr) => {
+        const ci = getMonthAbs(monthStr);
+        annotations[`bg_${fromTs}_${toTs2}`] = {
+            type: 'box',
+            xMin: fromTs, xMax: toTs2,
+            backgroundColor: colors[ci % 2],
+            borderWidth: 0, // 隱藏邊框
+            drawTime: 'beforeDatasetsDraw' // 設定在資料折線/長條圖被畫出來"之前"先畫背景，避免遮擋資料
+        };
+    };
+
+    // 走訪所有日期，一旦月份改變，就把上一個月份的區間畫成一個色塊
+    for (let i = 1; i <= dates.length; i++) {
+        const month = i < dates.length ? dates[i].slice(0, 7) : null;
+        if (month !== curMonth) {
+            flush(startTs, toTs(dates[i - 1]), curMonth);
+            // 推進到下一個月份
+            if (i < dates.length) { startTs = toTs(dates[i]); curMonth = month; }
+        }
+    }
+    return annotations;
+}
+
+// 功能：根據資料陣列的日期，尋找「跨年第一週」的位置，產生黑色的「跨年垂直分割線」
+function buildYearAnnotsByDates(dates) {
+    const toTs = d => new Date(d + 'T00:00:00').getTime();
+    const annotations = {};
+    let prevYear = null;
+    
+    dates.forEach((d, i) => {
+        const yr = d.slice(0, 4); // 擷取年份
+        const mo = d.slice(5, 7); // 擷取月份
+        
+        // 判斷是否跨年，且為該年 1 月份的資料點
+        if (prevYear !== null && yr !== prevYear && mo === '01') {
+            const ts = toTs(d);
+            annotations[`year_${i}`] = {
+                type: 'line',
+                xMin: ts, xMax: ts, // X軸起點終點相同，形成垂直線
+                borderColor: 'rgba(0,0,0,0.75)', // 黑色半透明線條
+                borderWidth: 2,
+                borderDash: [6, 4], // 虛線樣式
+                drawTime: 'afterDatasetsDraw' // 在資料畫完之後畫，確保線條清晰可見
+            };
+        }
+        prevYear = yr;
+    });
+    return annotations;
+}
+
+// ════════════════════════════════════════════════════════
+//  5. 月份背景 + 年份分界線 annotation 產生器（category 軸用，保留備用）
+
+//     (對應 Python 版的 add_vrect / add_vline)
+// ════════════════════════════════════════════════════════
+function buildMonthAnnotations(labels, isCandle) {
+    const annotations = {};
+    if (!labels.length) return annotations;
+
+    // 解析月份
+    let curMonth = labels[0].slice(0, 7); // "yyyy-MM"
+    let startIdx = 0;
+    let colorIdx = 0;
+    const colors = [
+        'rgba(230,245,255,0.35)',
+        'rgba(200,230,255,0.35)'
+    ];
+
+    const flush = (from, to, ci) => {
+        const key = `bg_${from}_${to}`;
+        annotations[key] = {
+            type: 'box',
+            xMin: labels[from],
+            xMax: labels[to],
+            backgroundColor: colors[ci % 2],
+            borderWidth: 0,
+            drawTime: 'beforeDatasetsDraw'
+        };
+    };
+
+    for (let i = 1; i <= labels.length; i++) {
+        const month = i < labels.length ? labels[i].slice(0, 7) : null;
+        if (month !== curMonth) {
+            flush(startIdx, i - 1, colorIdx);
+            colorIdx++;
+            startIdx = i;
+            curMonth = month;
+        }
+    }
+    return annotations;
+}
+
+function buildYearAnnotations(labels) {
+    const annotations = {};
+    let prevYear = null;
+    labels.forEach((d, i) => {
+        const yr = d.slice(0, 4);
+        const mo = d.slice(5, 7);
+        if (prevYear !== null && yr !== prevYear && mo === '01') {
+            annotations[`year_${i}`] = {
+                type: 'line',
+                xMin: d,
+                xMax: d,
+                borderColor: 'rgba(0,0,0,0.75)',
+                borderWidth: 2,
+                borderDash: [6, 4],
+                drawTime: 'afterDatasetsDraw'
+            };
+        }
+        prevYear = yr;
+    });
+    return annotations;
+}
+
+// ── 5b. K 線圖專用：以 timestamp（毫秒）為 xMin/xMax 的 annotation 建構器 ──
+function buildMonthAnnotationsTs(ohlcData) {
+    const annotations = {};
+    if (!ohlcData.length) return annotations;
+    const colors = ['rgba(230,245,255,0.35)', 'rgba(200,230,255,0.35)'];
+    let colorIdx = 0;
+    let startTs  = ohlcData[0].x;
+    let curMonth = new Date(ohlcData[0].x).toISOString().slice(0, 7);
+
+    const flush = (fromTs, toTs, ci) => {
+        const key = `bg_${fromTs}_${toTs}`;
+        annotations[key] = {
+            type: 'box',
+            xMin: fromTs,
+            xMax: toTs,
+            backgroundColor: colors[ci % 2],
+            borderWidth: 0,
+            drawTime: 'beforeDatasetsDraw'
+        };
+    };
+
+    for (let i = 1; i <= ohlcData.length; i++) {
+        const ts    = i < ohlcData.length ? ohlcData[i].x : null;
+        const month = ts ? new Date(ts).toISOString().slice(0, 7) : null;
+        if (month !== curMonth) {
+            flush(startTs, ohlcData[i - 1].x, colorIdx);
+            colorIdx++;
+            if (ts) { startTs = ts; curMonth = month; }
+        }
+    }
+    return annotations;
+}
+
+function buildYearAnnotationsTs(ohlcData) {
+    const annotations = {};
+    let prevYear = null;
+    ohlcData.forEach((d, i) => {
+        const dt = new Date(d.x);
+        const yr = dt.getUTCFullYear().toString();
+        const mo = String(dt.getUTCMonth() + 1).padStart(2, '0');
+        if (prevYear !== null && yr !== prevYear && mo === '01') {
+            annotations[`year_${i}`] = {
+                type: 'line',
+                xMin: d.x,
+                xMax: d.x,
+                borderColor: 'rgba(0,0,0,0.75)',
+                borderWidth: 2,
+                borderDash: [6, 4],
+                drawTime: 'afterDatasetsDraw'
+            };
+        }
+        prevYear = yr;
+    });
+    return annotations;
+}
+
+// ════════════════════════════════════════════════════════
+//  6. 移動十字線 Plugin（純 Canvas 繪製，不依賴額外套件）
+// ════════════════════════════════════════════════════════
+const crosshairPlugin = {
+    id: 'crosshair',
+    afterDatasetsDraw(chart) {
+        if (chart._crossX == null) return;
+        const { ctx, chartArea: ca } = chart;
+        const x = chart._crossX;
+        const y = chart._crossY;
+        ctx.save();
+        ctx.setLineDash([4, 4]);
+        ctx.strokeStyle = 'rgba(80,80,80,0.6)';
+        ctx.lineWidth = 1;
+        // 垂直線
+        if (x >= ca.left && x <= ca.right) {
+            ctx.beginPath(); ctx.moveTo(x, ca.top); ctx.lineTo(x, ca.bottom); ctx.stroke();
+        }
+        // 水平線 (如果另一張圖被同步且沒有 Y 座標，就不畫這條)
+        if (y != null && y >= ca.top && y <= ca.bottom) {
+            ctx.beginPath(); ctx.moveTo(ca.left, y); ctx.lineTo(ca.right, y); ctx.stroke();
+        }
+        ctx.restore();
+    },
+    afterEvent(chart, args) {
+        const e = args.event;
+        const ca = chart.chartArea;
+        if (!ca) return;
+
+        // 取得另一張圖的實例
+        let otherChart = null;
+        if (chart === chartOwnership) otherChart = chartCandle;
+        else if (chart === chartCandle) otherChart = chartOwnership;
+
+        if (e.type === 'mousemove' &&
+            e.x >= ca.left && e.x <= ca.right &&
+            e.y >= ca.top  && e.y <= ca.bottom) {
+            
+            chart._crossX = e.x;
+            chart._crossY = e.y;
+            chart.draw();
+
+            if (otherChart && otherChart.chartArea) {
+                otherChart._crossX = e.x;
+                otherChart._crossY = null; // 另一張圖只畫垂直線
+                otherChart.draw();
+            }
+
+        } else if (e.type === 'mouseleave') {
+            chart._crossX = null;
+            chart._crossY = null;
+            chart.draw();
+
+            if (otherChart) {
+                otherChart._crossX = null;
+                otherChart._crossY = null;
+                otherChart.draw();
+            }
+        }
+    }
+};
+
+// Register the shared crosshair plugin for both chart instances.
+Chart.register(crosshairPlugin);
+
+// ════════════════════════════════════════════════════════
+//  7. 載入 chartjs-plugin-annotation（月份背景 / 年份線）
+// ════════════════════════════════════════════════════════
+(function loadAnnotationPlugin() {
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js';
+    s.onload = () => {
+        Chart.register(window['chartjs-plugin-annotation']);
+        // 顧色設定再確認一次（plugin 載入可能重置預設值）
+        if (window._applyTaiwanColors) window._applyTaiwanColors();
+        // 注意：不再呼叫 syncChartAreas，避免干擾 K 線 annotation 座標
+    };
+    document.head.appendChild(s);
+})();
+
+
+
+// ════════════════════════════════════════════════════════
+//  8. Modal 控制與快捷鍵綁定
+// ════════════════════════════════════════════════════════
+// 點擊 Modal 半透明背景時關閉
+function closeModal(event) {
+    if (event.target.id === 'modal') closeModalDirect();
+}
+
+// 直接關閉 Modal 並釋放 Chart 記憶體
+function closeModalDirect() {
+    document.getElementById('modal').style.display = 'none';
+    if (chartOwnership) { chartOwnership.destroy(); chartOwnership = null; }
+    if (chartCandle)    { chartCandle.destroy();    chartCandle    = null; }
+}
+
+// Modal 內切換「上一檔 / 下一檔」股票圖表
+function navigateImg(direction) {
+    if (!stockList.length) return;
+    // 使用模除運算，實現循環切換 (第一檔上一頁會跳到最後一檔)
+    currentIndex = (currentIndex + direction + stockList.length) % stockList.length;
+    openModal(currentIndex); // 重新載入新圖表
+}
+
+// 開啟紅綠燈連結
+function openTrafficLight() {
+    if (!stockList.length || currentIndex < 0 || currentIndex >= stockList.length) return;
+    const stockId = stockList[currentIndex].id;
+    window.open(`https://gd.myftp.org/lb/lh.asp?stockno=${stockId}`, '_blank');
+}
+
+// 列表畫面的「上一頁 / 下一頁」分頁切換
+function changePage(direction) {
+    const totalPages = Math.ceil(stockList.length / 50);
+    const next = currentPage + direction;
+    // 檢查是否超出邊界
+    if (next >= 0 && next < totalPages) { 
+        currentPage = next; 
+        renderTable(); // 重新渲染列表
+    }
+}
+
+// 全局鍵盤事件綁定 (Esc關閉、左右鍵切換)
+document.addEventListener('keydown', e => {
+    // 按 Esc 關閉
+    if (e.key === 'Escape' || e.key === 'Esc') closeModalDirect();
+    
+    // 如果 Modal 處於顯示狀態，允許使用鍵盤左右鍵快速切換圖表
+    if (document.getElementById('modal').style.display === 'flex') {
+        if (e.key === 'ArrowLeft')  navigateImg(-1); // 上一檔
+        if (e.key === 'ArrowRight') navigateImg(1);  // 下一檔
+    }
+});
+
+const default0050 = `2330    台積電
+2308    台達電
+2317    鴻海
+2454    聯發科
+3711    
+2891    中信金
+2345    智邦
+2383    
+2382    廣達
+2881    富邦金
+2882    國泰金
+2303    聯電
+3017    奇鋐
+2360    致茂
+2887    台新新光金
+2412    中華電
+2884    玉山金
+2885    元大金
+2886    兆豐金
+2890    永豐金
+2357    華碩
+3231    緯創
+2327    國巨*
+1303    南亞
+1216    統一
+6669    緯穎
+3653    健策
+2880    華南金
+2892    第一金
+2883    凱基金
+2368    金像電
+2449    京元電子
+2344    華邦電
+2301    光寶科
+5880    合庫金
+2408    南亞科
+2603    長榮
+2002    中鋼
+3008    大立光
+3661    世芯-KY
+7769    鴻勁
+1301    台塑
+2059    川湖
+4904    遠傳
+3045    台灣大
+2395    研華
+2207    和泰車
+6919    康霈*
+6505    台塑化`;
+
+function resetTo0050() {
+    document.getElementById('inputArea').value = default0050;
+}
+
+function saveStockList() {
+    const text = document.getElementById('inputArea').value;
+    localStorage.setItem('savedStockList', text);
+    alert('自訂股票清單已成功儲存至瀏覽器！');
+}
+
+const CUSTOM_GROUPS_KEY = 'customStockGroups';
+let currentGroupId = null;
+
+function getCustomGroups() {
+    try {
+        const groups = JSON.parse(localStorage.getItem(CUSTOM_GROUPS_KEY) || '[]');
+        return Array.isArray(groups) ? groups : [];
+    } catch (e) {
+        return [];
+    }
+}
+
+function setCustomGroups(groups) {
+    localStorage.setItem(CUSTOM_GROUPS_KEY, JSON.stringify(groups));
+}
+
+function escapeHtml(value) {
+    return String(value).replace(/[&<>"]/g, ch => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;'
+    }[ch]));
+}
+
+function renderCustomGroups() {
+    const list = document.getElementById('customGroupList');
+    if (!list) return;
+
+    const groups = getCustomGroups().slice().sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'zh-Hant'));
+    if (!groups.length) {
+        list.innerHTML = '<div class="group-empty">尚未建立自訂群組</div>';
+        return;
+    }
+
+    list.innerHTML = groups.map(group => `
+        <div class="group-row">
+            <button type="button" class="group-load-btn" onclick="loadCustomGroup('${group.id}')">${escapeHtml(group.name)}</button>
+            <button type="button" class="group-delete-btn" onclick="deleteCustomGroup('${group.id}')">刪除</button>
+        </div>
+    `).join('');
+}
+
+function showGroupEditor(groupId, groupName) {
+    currentGroupId = groupId || null;
+    const editor = document.getElementById('groupEditor');
+    const input = document.getElementById('groupNameInput');
+    editor.style.display = 'flex';
+    input.value = groupName || '';
+    updateSaveGroupButton();
+    input.focus();
+}
+
+function startNewGroup() {
+    showGroupEditor(null, '');
+}
+
+function updateSaveGroupButton() {
+    const input = document.getElementById('groupNameInput');
+    const button = document.getElementById('saveGroupButton');
+    const name = input.value.trim();
+    button.style.display = 'inline-block';
+    button.disabled = !name;
+    button.textContent = name ? `儲存 ${name} 群組` : '儲存群組';
+}
+
+function saveCurrentGroup() {
+    const name = document.getElementById('groupNameInput').value.trim();
+    const content = document.getElementById('inputArea').value;
+    if (!name) {
+        alert('請輸入群組名稱。');
+        return;
+    }
+
+    const groups = getCustomGroups();
+    const now = new Date().toISOString();
+    const currentGroup = currentGroupId ? groups.find(item => item.id === currentGroupId) : null;
+    const duplicate = groups.find(group => group.name === name && group.id !== currentGroupId);
+
+    if (duplicate && !confirm(`已存在「${name}」群組，是否覆蓋？`)) return;
+
+    if (duplicate) {
+        duplicate.content = content;
+        duplicate.updatedAt = now;
+        currentGroupId = duplicate.id;
+    } else if (currentGroup && currentGroup.name === name) {
+        currentGroup.content = content;
+        currentGroup.updatedAt = now;
+    } else {
+        currentGroupId = `group-${Date.now()}`;
+        groups.push({ id: currentGroupId, name, content, updatedAt: now });
+    }
+
+    setCustomGroups(groups);
+    renderCustomGroups();
+    updateSaveGroupButton();
+    document.getElementById('customGroupPanel').open = true;
+    alert(`「${name}」群組已儲存。`);
+}
+
+function loadCustomGroup(groupId) {
+    const group = getCustomGroups().find(item => item.id === groupId);
+    if (!group) {
+        alert('找不到這個群組，可能已被刪除。');
+        renderCustomGroups();
+        return;
+    }
+
+    document.getElementById('inputArea').value = group.content || '';
+    showGroupEditor(group.id, group.name);
+    processInput();
+}
+
+function deleteCustomGroup(groupId) {
+    const groups = getCustomGroups();
+    const group = groups.find(item => item.id === groupId);
+    if (!group) return;
+    if (!confirm(`確定刪除「${group.name}」群組？`)) return;
+
+    setCustomGroups(groups.filter(item => item.id !== groupId));
+    if (currentGroupId === groupId) {
+        currentGroupId = null;
+        document.getElementById('groupNameInput').value = '';
+        document.getElementById('groupEditor').style.display = 'none';
+        updateSaveGroupButton();
+    }
+    renderCustomGroups();
+    document.getElementById('customGroupPanel').open = true;
+}
+
+window.onload = function() {
+    const groups = getCustomGroups().slice().sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'zh-Hant'));
+    if (groups.length) {
+        const firstGroup = groups[0];
+        document.getElementById('inputArea').value = firstGroup.content || '';
+        showGroupEditor(firstGroup.id, firstGroup.name);
+    } else {
+        const saved = localStorage.getItem('savedStockList');
+        if (saved) {
+            document.getElementById('inputArea').value = saved;
+        }
+    }
+    renderCustomGroups();
+    processInput();
+};</script>
+</body>
+</html>
